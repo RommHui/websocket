@@ -67,7 +67,7 @@ func mustRead(ctx context.Context, reader io.Reader, p []byte) (int, error) {
 	return read, nil
 }
 
-var blackhole = rwFunc(func(b []byte) (int, error) {
+var blackHole = rwFunc(func(b []byte) (int, error) {
 	return len(b), nil
 })
 
@@ -87,4 +87,32 @@ func getSecAcceptKey(SecWebsocketKey string) (string, error) {
 		}
 	}
 	return base64.StdEncoding.EncodeToString(hash.Sum(nil)), nil
+}
+
+func newBytesBuffer(b []byte) io.Reader {
+	offset := 0
+	return rwFunc(func(p []byte) (int, error) {
+		if len(b) <= offset {
+			return 0, io.EOF
+		}
+		n := copy(p, b[offset:])
+		offset += n
+		return n, nil
+	})
+}
+
+func bigEndianUint64Unpack(p []byte) uint64 {
+	v := uint64(0)
+	for _, x := range p {
+		v <<= 8
+		v |= uint64(x)
+	}
+	return v
+}
+
+func bigEndianUint64Pack(p []byte, v uint64) {
+	for i := range p {
+		p[len(p)-i-1] = byte(v & 255)
+		v >>= 8
+	}
 }

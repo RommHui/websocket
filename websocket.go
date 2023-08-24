@@ -2,16 +2,15 @@ package websocket
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"golang.org/x/net/proxy"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 type OpCode byte
@@ -87,10 +86,12 @@ const (
 )
 
 type webSocket struct {
-	writer io.WriteCloser
-	reader io.ReadCloser
-	mask   bool
-	status uint8
+	writer   io.WriteCloser
+	reader   io.ReadCloser
+	mask     bool
+	status   uint8
+	readLock *sync.Mutex
+	sendLock *sync.Mutex
 }
 
 // NewWebSocket 使用 io.WriteCloser 和 io.ReadCloser 创建一个 WebSocket 对象。
@@ -99,10 +100,12 @@ type webSocket struct {
 // 使用 NewWebSocket 这个函数，就可以单独的去使用 WebSocket 协议，无需经过 HTTP 的 Connection Upgrade 到 WebSocket ，也就是可以让一条纯 TCP 连接去使用。
 func NewWebSocket(writer io.WriteCloser, reader io.ReadCloser, mask bool) WebSocket {
 	return &webSocket{
-		writer: writer,
-		reader: reader,
-		mask:   mask,
-		status: OPEN,
+		writer:   writer,
+		reader:   reader,
+		mask:     mask,
+		status:   OPEN,
+		readLock: &sync.Mutex{},
+		sendLock: &sync.Mutex{},
 	}
 }
 
@@ -183,20 +186,22 @@ func ConnectWithDialer(ctx context.Context, dialer func(context.Context, string,
 		return nil, errors.New(resp.Status)
 	}
 	if !strings.Contains(strings.ToLower(resp.Header.Get("connection")), "upgrade") {
-		return nil, fmt.Errorf("WebSocket connection to '%s' failed", request.URL)
+		return nil, errors.New("WebSocket connection to '" + request.URL.String() + "' failed")
 	}
 	if !strings.Contains(strings.ToLower(resp.Header.Get("upgrade")), "websocket") {
-		return nil, fmt.Errorf("WebSocket connection to '%s' failed", request.URL)
+		return nil, errors.New("WebSocket connection to '" + request.URL.String() + "' failed")
 	}
 	secAcceptKey, err := getSecAcceptKey(request.Header.Get("sec-websocket-key"))
 	if err != nil {
 		return nil, err
 	}
 	if secAcceptKey != resp.Header.Get("sec-websocket-accept") {
-		return nil, fmt.Errorf("WebSocket connection to '%s' failed", request.URL)
+		return nil, errors.New("WebSocket connection to '" + request.URL.String() + "' failed")
 	}
 	return NewWebSocket(conn, conn, true), nil
 }
+
+var ErrHijackResponseWriterFailed = errors.New("hijack the http.ResponseWriter failed")
 
 // Pair 用于 HTTP 服务端接收一个 WebSocket 对象
 //
@@ -211,7 +216,11 @@ func ConnectWithDialer(ctx context.Context, dialer func(context.Context, string,
 //	})
 //	http.ListenAndServe("0.0.0.0:8080")
 func Pair(w http.ResponseWriter, req *http.Request) (WebSocket, error) {
-	conn, _, err := w.(http.Hijacker).Hijack()
+	hijack, ok := w.(http.Hijacker)
+	if !ok {
+		return nil, ErrHijackResponseWriterFailed
+	}
+	conn, _, err := hijack.Hijack()
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +268,7 @@ func pair(writer io.WriteCloser, reader io.ReadCloser, request *http.Request) (W
 
 func (w *webSocket) Send(text string) error {
 	return w.SendMessage(&Message{
-		Reader: bytes.NewBufferString(text),
+		Reader: newBytesBuffer([]byte(text)),
 		OpCode: TextFrame,
 	})
 }
@@ -269,13 +278,13 @@ func (w *webSocket) Ping() error {
 }
 
 func (w *webSocket) Close() error {
-	err := w.sendMessage(&Message{
+	err := w.SendMessage(&Message{
 		OpCode: ConnectionClose,
 	})
-	w.status = CLOSING
 	if err != nil {
 		return err
 	}
+	w.status = CLOSING
 	for _, closeFn := range []func() error{w.writer.Close, w.reader.Close} {
 		if closeErr := closeFn(); closeErr != nil && errors.Is(err, net.ErrClosed) {
 			return closeErr
@@ -308,7 +317,7 @@ func (w *webSocket) ping() error {
 		}
 		if message.OpCode != Pong {
 			continue
-		} else if _, err = io.Copy(blackhole, message); err != nil {
+		} else if _, err = io.Copy(blackHole, message); err != nil {
 			return err
 		} else {
 			return nil
@@ -325,7 +334,7 @@ func (w *webSocket) sendFrame(ctx context.Context, frame *Frame) error {
 	if w.status > OPEN {
 		return ErrClosedStatus
 	}
-	_, err := io.Copy(w.writer, contextReader(ctx, frame.encodeFrame()))
+	_, err := io.Copy(w.writer, contextReader(ctx, frame.Encode()))
 	return err
 }
 
@@ -334,7 +343,7 @@ func (w *webSocket) readFrame(ctx context.Context) (*Frame, error) {
 		return nil, ErrClosedStatus
 	}
 	frame := &Frame{}
-	err := frame.decodeFrame(ctx, w.reader)
+	err := frame.Decode(ctx, w.reader)
 	if err != nil {
 		return nil, err
 	}

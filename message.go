@@ -1,7 +1,6 @@
 package websocket
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -35,7 +34,7 @@ func (w *webSocket) sendMessage(message *Message) error {
 			continue
 		}
 		frame.Payload = &io.LimitedReader{
-			R: bytes.NewBuffer(buf[:offset]),
+			R: newBytesBuffer(buf[:offset]),
 			N: int64(offset),
 		}
 		frame.Fin = err != nil
@@ -52,12 +51,15 @@ func (w *webSocket) sendMessage(message *Message) error {
 }
 
 func (w *webSocket) SendMessage(message *Message) error {
+	w.sendLock.Lock()
+	defer w.sendLock.Unlock()
 	return w.sendMessage(message)
 }
 
 var ErrPreviousMessageNotReadToCompletion = errors.New("previous message not read to completion")
 
 func (w *webSocket) readMessage() (*Message, error) {
+	w.readLock.Lock()
 	ctx := context.Background()
 	frame, err := w.readFrame(ctx)
 	if err != nil {
@@ -71,6 +73,9 @@ func (w *webSocket) readMessage() (*Message, error) {
 					if readErr == io.EOF && frame.Fin != true {
 						readErr = nil
 						frame = nil
+					}
+					if readErr != nil {
+						w.readLock.Unlock()
 					}
 					return n, readErr
 				}
@@ -103,7 +108,12 @@ func (w *webSocket) ReadMessage() (*Message, error) {
 			if err != nil {
 				return nil, err
 			}
+			_, err = io.Copy(blackHole, message)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return message, nil
 		}
-		return message, nil
 	}
 }

@@ -1,9 +1,7 @@
 package websocket
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,10 +15,14 @@ type Frame struct {
 }
 
 func (f *Frame) String() string {
+	if f.Payload == nil {
+		f.Payload = emptyReader
+	}
 	return fmt.Sprintf("Frame(%s){Fin:%v Mask:%v PayloadLen:%d}", f.OpCode, f.Fin, f.Mask, f.Payload.N)
 }
 
-func (f *Frame) decodeFrame(ctx context.Context, reader io.Reader) error {
+// Decode 用于从 io.Reader 中反序列化到 Frame
+func (f *Frame) Decode(ctx context.Context, reader io.Reader) error {
 	buf := make([]byte, 8)
 	_, err := mustRead(ctx, reader, buf[:2])
 	if err != nil {
@@ -44,7 +46,7 @@ func (f *Frame) decodeFrame(ctx context.Context, reader io.Reader) error {
 		}
 	}
 	if extendPayloadLength > 0 {
-		f.Payload.N = int64(binary.BigEndian.Uint64(buf[:extendPayloadLength]))
+		f.Payload.N = int64(bigEndianUint64Unpack(buf[:extendPayloadLength]))
 	}
 	maskKey := buf[:4]
 	if f.Mask {
@@ -58,7 +60,8 @@ func (f *Frame) decodeFrame(ctx context.Context, reader io.Reader) error {
 	return nil
 }
 
-func (f *Frame) encodeFrame() io.Reader {
+// Encode 用于从 Frame 中把数据序列化
+func (f *Frame) Encode() io.Reader {
 	buf := make([]byte, 14)
 	headerLen := 2
 	if f.Fin {
@@ -81,7 +84,7 @@ func (f *Frame) encodeFrame() io.Reader {
 		extendedPayloadLen = 8
 	}
 	if extendedPayloadLen > 0 {
-		binary.BigEndian.PutUint64(buf[2:extendedPayloadLen], uint64(f.Payload.N))
+		bigEndianUint64Pack(buf[2:extendedPayloadLen+2], uint64(f.Payload.N))
 		headerLen += extendedPayloadLen
 	}
 	if f.Mask {
@@ -90,5 +93,5 @@ func (f *Frame) encodeFrame() io.Reader {
 		f.Payload.R = maskReader(maskKey, f.Payload.R)
 	}
 
-	return io.MultiReader(bytes.NewBuffer(buf[:headerLen]), f.Payload)
+	return io.MultiReader(newBytesBuffer(buf[:headerLen]), f.Payload)
 }
